@@ -11,7 +11,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from schemas import FarmRequest, PredictionResponse
 from services import MODEL_VERSION, create_prediction
-from storage import predictions
+from contextlib import asynccontextmanager
+from storage import (
+    find_predictions,
+    init_db,
+    list_predictions,
+    save_prediction,
+)
 
 
 logging.basicConfig(
@@ -21,6 +27,10 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
 
 app = FastAPI(
     title="Agro Scoring API",
@@ -29,6 +39,7 @@ app = FastAPI(
         "The score is rule-based, not a trained ML model."
     ),
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -148,32 +159,29 @@ def model_info():
 @app.post(
     "/predict",
     response_model=PredictionResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_200_OK,
     responses={
         400: {"description": "Unknown region"},
         422: {"description": "Validation error"},
+        503: {"description": "Prediction storage is unavailable"},
     },
     summary="Score a farm",
     description=(
         "Validates farm data, calculates a risk score, "
-        "and stores the prediction in memory."
+        "and returns success only after saving it to SQLite."
     ),
 )
-def predict(
+async def predict(
     data: FarmRequest,
     request: Request,
 ):
     request_id = request.state.request_id
 
     result = create_prediction(data, request_id)
-    predictions[request_id] = result
 
-    logger.info(
-        "Prediction stored in memory | request_id=%s | "
-        "risk_score=%s | risk_level=%s",
-        request_id,
-        result.risk_score,
-        result.risk_level,
+    await save_prediction(
+        result,
+        source="single",
     )
 
     return result
@@ -184,35 +192,65 @@ def predict(
     response_model=PredictionResponse,
     responses={
         404: {"description": "Prediction not found"},
+        409: {"description": "Multiple predictions for this request"},
+        503: {"description": "Prediction storage is unavailable"},
     },
-    summary="Get prediction by ID",
+    summary="Get one prediction by request ID",
 )
-def get_prediction(request_id: str):
-    if request_id not in predictions:
+async def get_prediction(request_id: str):
+    results = await find_predictions(request_id)
+
+    if not results:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=404,
             detail="Prediction not found",
         )
 
-    return predictions[request_id]
+    if len(results) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This request_id contains multiple predictions. "
+                f"Use /requests/{request_id}/predictions"
+            ),
+        )
+
+    return results[0]
 
 
 @app.get(
     "/predictions",
     response_model=list[PredictionResponse],
-    summary="List recent predictions",
+    responses={
+        503: {"description": "Prediction storage is unavailable"},
+    },
+    summary="List recent predictions from SQLite",
 )
-def get_predictions(
+async def get_predictions(
     limit: int = Query(default=10, ge=1, le=100),
     risk_level: Literal["low", "medium", "high"] | None = None,
 ):
-    values = list(reversed(list(predictions.values())))
+    return await list_predictions(
+        limit=limit,
+        risk_level=risk_level,
+    )
+    
+@app.get(
+    "/requests/{request_id}/predictions",
+    response_model=list[PredictionResponse],
+    responses={
+        404: {"description": "Prediction not found"},
+        503: {"description": "Prediction storage is unavailable"},
+    },
+    summary="Get all predictions belonging to a request",
+)
+async def get_request_predictions(request_id: str):
+    results = await find_predictions(request_id)
 
-    if risk_level is not None:
-        values = [
-            item
-            for item in values
-            if item.risk_level == risk_level
-        ]
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail="Prediction not found",
+        )
 
-    return values[:limit]
+    return results
