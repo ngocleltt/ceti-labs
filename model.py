@@ -1,4 +1,10 @@
 from schemas import FarmRequest
+import asyncio
+
+from config import (
+    MODEL_FIXED_OVERHEAD_SECONDS,
+    MODEL_PER_ITEM_SECONDS,
+)
 
 
 def calculate_risk(data: FarmRequest) -> float:
@@ -17,3 +23,13 @@ def calculate_risk(data: FarmRequest) -> float:
         score += 0.1
 
     return round(min(score, 1.0), 2)
+
+async def model_predict_batch(
+    items: list[FarmRequest],
+) -> list[float]:
+    await asyncio.sleep(
+        MODEL_FIXED_OVERHEAD_SECONDS
+        + MODEL_PER_ITEM_SECONDS * len(items)
+    )
+
+    return [calculate_risk(item) for item in items]

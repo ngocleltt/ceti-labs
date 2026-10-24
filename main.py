@@ -1,5 +1,8 @@
+import asyncio
 import logging
 import time
+
+from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import uuid4
 
@@ -9,20 +12,40 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from config import INFERENCE_TIMEOUT_SECONDS
+from model import model_predict_batch
+
+import config
+from batching import DynamicBatcher
+import httpx
+from llm import build_explanation_prompt, call_llm
+
 from schemas import (
+    BatchPredictionResponse,
+    BatchRequest,
     FarmRequest,
+    LLMChatRequest,
+    LLMChatResponse,
     PaginatedPredictionsResponse,
     PredictionResponse,
+    PredictWithLLMResponse,
 )
 
-from services import MODEL_VERSION, create_prediction
-from contextlib import asynccontextmanager
+from services import (
+    MODEL_VERSION,
+    build_batch_predictions,
+    build_prediction_from_score,
+    create_prediction,
+    validate_batch_regions,
+)
+
 from storage import (
     find_predictions,
     get_weekday_predictions,
     init_db,
     list_predictions,
     save_prediction,
+    save_predictions_batch,
 )
 
 
@@ -33,15 +56,45 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+WEEKDAY_MAP = {
+    "sunday": "0",
+    "monday": "1",
+    "tuesday": "2",
+    "wednesday": "3",
+    "thursday": "4",
+    "friday": "5",
+    "saturday": "6",
+}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
+
+    batcher = DynamicBatcher()
+    app.state.batcher = batcher
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(config.LLM_TIMEOUT_SECONDS),
+    ) as llm_client:
+        app.state.llm_client = llm_client
+
+        await batcher.start()
+
+        try:
+            yield
+
+        finally:
+            await batcher.stop()
+
 
 app = FastAPI(
     title="Agro Scoring API",
     description=(
         "Prototype REST API for agricultural risk scoring. "
+        "Includes request tracking, SQLite storage, "
+        "weekday pagination and explicit batching. "
         "The score is rule-based, not a trained ML model."
     ),
     version="2.0.0",
@@ -96,7 +149,6 @@ async def request_context_middleware(
     )
 
     return response
-
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(
@@ -161,7 +213,6 @@ def model_info():
         "status": "ready",
     }
 
-
 @app.post(
     "/predict",
     response_model=PredictionResponse,
@@ -191,15 +242,62 @@ async def predict(
     )
 
     return result
-WEEKDAY_MAP = {
-    "sunday": "0",
-    "monday": "1",
-    "tuesday": "2",
-    "wednesday": "3",
-    "thursday": "4",
-    "friday": "5",
-    "saturday": "6",
-}
+
+
+@app.post(
+    "/batch-predict",
+    response_model=BatchPredictionResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        400: {"description": "Unknown region in batch"},
+        422: {"description": "Invalid input or batch size"},
+        503: {"description": "Prediction storage is unavailable"},
+        504: {"description": "Batch inference timeout"},
+    },
+    summary="Score multiple farms in one request",
+    description=(
+        "Processes 1 to 8 farms with one batch model call "
+        "and saves all predictions in one SQLite transaction."
+    ),
+)
+async def batch_predict(
+    data: BatchRequest,
+    request: Request,
+):
+    started = time.perf_counter()
+    request_id = request.state.request_id
+
+    validate_batch_regions(data.items)
+
+    try:
+        scores = await asyncio.wait_for(
+            model_predict_batch(data.items),
+            timeout=INFERENCE_TIMEOUT_SECONDS,
+        )
+
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Batch inference timeout",
+        ) from exc
+
+    results = build_batch_predictions(
+        items=data.items,
+        scores=scores,
+        request_id=request_id,
+    )
+
+    await save_predictions_batch(results)
+
+    return BatchPredictionResponse(
+        request_id=request_id,
+        batch_size=len(results),
+        processing_time_ms=round(
+            (time.perf_counter() - started) * 1000,
+            2,
+        ),
+        items=results,
+    )
 
 @app.get(
     "/predictions/by-weekday",
@@ -232,7 +330,7 @@ async def predictions_by_weekday(
 
     if weekday not in WEEKDAY_MAP:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 "weekday must be one of: monday, tuesday, "
                 "wednesday, thursday, friday, saturday, sunday"
@@ -249,11 +347,12 @@ async def predictions_by_weekday(
 
     if page > max(total_pages, 1):
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Page not found",
         )
 
     next_page = None
+
     if page < total_pages:
         next_page = str(
             request.url.include_query_params(
@@ -264,6 +363,7 @@ async def predictions_by_weekday(
         )
 
     prev_page = None
+
     if page > 1:
         prev_page = str(
             request.url.include_query_params(
@@ -286,36 +386,6 @@ async def predictions_by_weekday(
         },
     }
 
-@app.get(
-    "/predictions/{request_id}",
-    response_model=PredictionResponse,
-    responses={
-        404: {"description": "Prediction not found"},
-        409: {"description": "Multiple predictions for this request"},
-        503: {"description": "Prediction storage is unavailable"},
-    },
-    summary="Get one prediction by request ID",
-)
-async def get_prediction(request_id: str):
-    results = await find_predictions(request_id)
-
-    if not results:
-        raise HTTPException(
-            status_code=404,
-            detail="Prediction not found",
-        )
-
-    if len(results) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This request_id contains multiple predictions. "
-                f"Use /requests/{request_id}/predictions"
-            ),
-        )
-
-    return results[0]
-
 
 @app.get(
     "/predictions",
@@ -333,7 +403,38 @@ async def get_predictions(
         limit=limit,
         risk_level=risk_level,
     )
-    
+
+@app.get(
+    "/predictions/{request_id}",
+    response_model=PredictionResponse,
+    responses={
+        404: {"description": "Prediction not found"},
+        409: {"description": "Multiple predictions for this request"},
+        503: {"description": "Prediction storage is unavailable"},
+    },
+    summary="Get one prediction by request ID",
+)
+async def get_prediction(request_id: str):
+    results = await find_predictions(request_id)
+
+    if not results:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prediction not found",
+        )
+
+    if len(results) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This request_id contains multiple predictions. "
+                f"Use /requests/{request_id}/predictions"
+            ),
+        )
+
+    return results[0]
+
+
 @app.get(
     "/requests/{request_id}/predictions",
     response_model=list[PredictionResponse],
@@ -348,8 +449,164 @@ async def get_request_predictions(request_id: str):
 
     if not results:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Prediction not found",
         )
 
     return results
+
+@app.post(
+    "/predict-queued",
+    response_model=PredictionResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        400: {"description": "Unknown region"},
+        422: {"description": "Validation error"},
+        429: {"description": "Inference queue is full"},
+        503: {"description": "Model, worker or storage unavailable"},
+        504: {"description": "Inference timeout"},
+    },
+    summary="Score one farm through dynamic batching",
+    description=(
+        "Queues one farm for dynamic batching, waits for its "
+        "own score and saves the prediction before returning."
+    ),
+)
+async def predict_queued(
+    data: FarmRequest,
+    request: Request,
+):
+    request_id = request.state.request_id
+
+    validate_batch_regions([data])
+
+    score = await request.app.state.batcher.submit(
+        data=data,
+        request_id=request_id,
+    )
+
+    result = build_prediction_from_score(
+        data=data,
+        score=score,
+        request_id=request_id,
+    )
+
+    await save_prediction(
+        result,
+        source="queued",
+    )
+
+    return result
+
+@app.get(
+    "/queue-status",
+    summary="Get queue size and batching settings",
+)
+async def queue_status(request: Request):
+    batcher = request.app.state.batcher
+
+    return {
+        "queue_size": batcher.queue.qsize(),
+        "queue_max_size": batcher.queue.maxsize,
+        "max_batch_size": config.MAX_BATCH_SIZE,
+        "max_batch_wait_ms": config.MAX_BATCH_WAIT_MS,
+        "inference_timeout_seconds": (
+            config.INFERENCE_TIMEOUT_SECONDS
+        ),
+    }
+    
+@app.post(
+    "/llm/chat",
+    response_model=LLMChatResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        422: {"description": "Validation error"},
+        502: {"description": "Invalid response or error from LLM provider"},
+        503: {"description": "LLM service is unavailable"},
+        504: {"description": "LLM timeout"},
+    },
+    summary="Send a prompt to the external LLM",
+    description=(
+        "Calls the configured OpenAI-compatible LLM API. "
+        "Use synthetic educational data only."
+    ),
+)
+async def llm_chat(
+    data: LLMChatRequest,
+    request: Request,
+):
+    return await call_llm(
+        client=request.app.state.llm_client,
+        prompt=data.prompt,
+        request_id=request.state.request_id,
+        model=data.model,
+        temperature=data.temperature,
+        max_tokens=data.max_tokens,
+    )
+    
+@app.post(
+    "/predict-with-llm",
+    response_model=PredictWithLLMResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        400: {"description": "Unknown region"},
+        422: {"description": "Validation error"},
+        502: {"description": "LLM provider error"},
+        503: {"description": "Storage or external service unavailable"},
+        504: {"description": "Inference or LLM timeout"},
+    },
+    summary="Score a farm and explain the result with an LLM",
+    description=(
+        "Calculates and saves the scoring result first, then "
+        "requests an LLM explanation. The LLM does not calculate "
+        "or overwrite risk_score or risk_level. "
+        "If the LLM fails, the prediction remains stored."
+    ),
+)
+async def predict_with_llm(
+    data: FarmRequest,
+    request: Request,
+):
+    request_id = request.state.request_id
+
+    validate_batch_regions([data])
+
+    try:
+        scores = await asyncio.wait_for(
+            model_predict_batch([data]),
+            timeout=config.INFERENCE_TIMEOUT_SECONDS,
+        )
+
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Inference timeout",
+        ) from exc
+
+    if len(scores) != 1:
+        raise HTTPException(
+            status_code=503,
+            detail="Scoring model returned an invalid result",
+        )
+
+    prediction = build_prediction_from_score(
+        data=data,
+        score=scores[0],
+        request_id=request_id,
+    )
+
+    await save_prediction(
+        prediction,
+        source="single+llm",
+    )
+
+    llm_result = await call_llm(
+        client=request.app.state.llm_client,
+        prompt=build_explanation_prompt(prediction),
+        request_id=request_id,
+    )
+
+    return PredictWithLLMResponse(
+        prediction=prediction,
+        llm=llm_result,
+    )

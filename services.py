@@ -54,3 +54,61 @@ def create_prediction(
         recommendation=recommendation(level),
         model_version=MODEL_VERSION,
     )
+    
+def validate_batch_regions(
+    items: list[FarmRequest],
+) -> None:
+    for index, item in enumerate(items):
+        if item.region not in ALLOWED_REGIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown region at items[{index}]: "
+                    f"{item.region}"
+                ),
+            )
+
+
+def build_batch_predictions(
+    items: list[FarmRequest],
+    scores: list[float],
+    request_id: str,
+) -> list[PredictionResponse]:
+    if len(items) != len(scores):
+        raise RuntimeError(
+            "Batch model returned an unexpected number of scores"
+        )
+
+    results = []
+
+    for item, score in zip(items, scores):
+        level = risk_level(score)
+
+        results.append(
+            PredictionResponse(
+                request_id=request_id,
+                farm_id=item.farm_id,
+                risk_score=score,
+                risk_level=level,
+                recommendation=recommendation(level),
+                model_version=MODEL_VERSION,
+            )
+        )
+
+    return results
+
+def build_prediction_from_score(
+    data: FarmRequest,
+    score: float,
+    request_id: str,
+) -> PredictionResponse:
+    level = risk_level(score)
+
+    return PredictionResponse(
+        request_id=request_id,
+        farm_id=data.farm_id,
+        risk_score=score,
+        risk_level=level,
+        recommendation=recommendation(level),
+        model_version=MODEL_VERSION,
+    )

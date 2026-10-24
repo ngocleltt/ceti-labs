@@ -225,3 +225,67 @@ async def get_weekday_predictions(
             status_code=503,
             detail="Prediction storage is unavailable",
         ) from exc
+        
+async def save_predictions_batch(
+    results: list[PredictionResponse],
+    source: str = "batch",
+) -> None:
+    if not results:
+        return
+
+    rows = [
+        (
+            result.request_id,
+            result.farm_id,
+            result.risk_score,
+            result.risk_level,
+            result.recommendation,
+            result.model_version,
+            source,
+        )
+        for result in results
+    ]
+
+    try:
+        async with get_db() as db:
+            await db.execute("BEGIN;")
+
+            try:
+                await db.executemany(
+                    """
+                    INSERT INTO predictions (
+                        request_id,
+                        farm_id,
+                        risk_score,
+                        risk_level,
+                        recommendation,
+                        model_version,
+                        source
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    rows,
+                )
+
+                await db.commit()
+
+            except BaseException:
+                await db.rollback()
+                raise
+
+        logger.info(
+            "Batch committed | request_id=%s | count=%s",
+            results[0].request_id,
+            len(results),
+        )
+
+    except aiosqlite.Error as exc:
+        logger.exception(
+            "Batch database write failed | request_id=%s",
+            results[0].request_id,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Prediction storage is unavailable",
+        ) from exc
