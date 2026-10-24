@@ -20,3 +20,17 @@ class PredictionResponse(BaseModel):
     risk_level: str
     recommendation: str
     model_version: str
+    
+class PaginationMeta(BaseModel):
+    weekday: str
+    current_page: int
+    per_page: int
+    total_pages: int
+    total_items: int
+    next_page: str | None
+    prev_page: str | None
+
+
+class PaginatedPredictionsResponse(BaseModel):
+    data: list[PredictionResponse]
+    meta: PaginationMeta

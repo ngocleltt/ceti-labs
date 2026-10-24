@@ -9,11 +9,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from schemas import FarmRequest, PredictionResponse
+from schemas import (
+    FarmRequest,
+    PaginatedPredictionsResponse,
+    PredictionResponse,
+)
+
 from services import MODEL_VERSION, create_prediction
 from contextlib import asynccontextmanager
 from storage import (
     find_predictions,
+    get_weekday_predictions,
     init_db,
     list_predictions,
     save_prediction,
@@ -185,7 +191,100 @@ async def predict(
     )
 
     return result
+WEEKDAY_MAP = {
+    "sunday": "0",
+    "monday": "1",
+    "tuesday": "2",
+    "wednesday": "3",
+    "thursday": "4",
+    "friday": "5",
+    "saturday": "6",
+}
 
+@app.get(
+    "/predictions/by-weekday",
+    response_model=PaginatedPredictionsResponse,
+    responses={
+        400: {"description": "Unknown weekday"},
+        404: {"description": "Page not found"},
+        422: {"description": "Validation error"},
+        503: {"description": "Prediction storage is unavailable"},
+    },
+    summary="List predictions by weekday with pagination",
+    description=(
+        "Filters predictions by the weekday of created_at "
+        "and returns a page with navigation metadata."
+    ),
+)
+async def predictions_by_weekday(
+    request: Request,
+    weekday: str = Query(
+        ...,
+        description=(
+            "monday, tuesday, wednesday, thursday, "
+            "friday, saturday or sunday"
+        ),
+    ),
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=5, ge=1, le=100),
+):
+    weekday = weekday.strip().lower()
+
+    if weekday not in WEEKDAY_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "weekday must be one of: monday, tuesday, "
+                "wednesday, thursday, friday, saturday, sunday"
+            ),
+        )
+
+    data, total_items = await get_weekday_predictions(
+        weekday_number=WEEKDAY_MAP[weekday],
+        page=page,
+        per_page=per_page,
+    )
+
+    total_pages = (total_items + per_page - 1) // per_page
+
+    if page > max(total_pages, 1):
+        raise HTTPException(
+            status_code=404,
+            detail="Page not found",
+        )
+
+    next_page = None
+    if page < total_pages:
+        next_page = str(
+            request.url.include_query_params(
+                weekday=weekday,
+                page=page + 1,
+                per_page=per_page,
+            )
+        )
+
+    prev_page = None
+    if page > 1:
+        prev_page = str(
+            request.url.include_query_params(
+                weekday=weekday,
+                page=page - 1,
+                per_page=per_page,
+            )
+        )
+
+    return {
+        "data": data,
+        "meta": {
+            "weekday": weekday,
+            "current_page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "total_items": total_items,
+            "next_page": next_page,
+            "prev_page": prev_page,
+        },
+    }
 
 @app.get(
     "/predictions/{request_id}",

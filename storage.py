@@ -176,3 +176,52 @@ async def find_predictions(
             status_code=503,
             detail="Prediction storage is unavailable",
         ) from exc
+        
+async def get_weekday_predictions(
+    weekday_number: str,
+    page: int,
+    per_page: int,
+) -> tuple[list[dict], int]:
+    offset = (page - 1) * per_page
+
+    try:
+        async with get_db() as db:
+            await db.execute("BEGIN;")
+
+            async with db.execute(
+                """
+                SELECT COUNT(*)
+                FROM predictions
+                WHERE strftime('%w', created_at) = ?;
+                """,
+                (weekday_number,),
+            ) as cursor:
+                count_row = await cursor.fetchone()
+                total_items = count_row[0]
+
+            async with db.execute(
+                """
+                SELECT *
+                FROM predictions
+                WHERE strftime('%w', created_at) = ?
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?;
+                """,
+                (weekday_number, per_page, offset),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            await db.commit()
+
+        return [dict(row) for row in rows], total_items
+
+    except aiosqlite.Error as exc:
+        logger.exception(
+            "Weekday pagination failed | weekday_number=%s",
+            weekday_number,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Prediction storage is unavailable",
+        ) from exc
