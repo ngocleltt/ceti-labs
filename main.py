@@ -35,7 +35,7 @@ from services import (
     MODEL_VERSION,
     build_batch_predictions,
     build_prediction_from_score,
-    create_prediction,
+    run_single_prediction,
     validate_batch_regions,
 )
 
@@ -220,21 +220,23 @@ def model_info():
     responses={
         400: {"description": "Unknown region"},
         422: {"description": "Validation error"},
-        503: {"description": "Prediction storage is unavailable"},
+        503: {"description": "Model or prediction storage unavailable"},
+        504: {"description": "Inference timeout"},
     },
     summary="Score a farm",
     description=(
-        "Validates farm data, calculates a risk score, "
-        "and returns success only after saving it to SQLite."
+        "Validates farm data, runs scoring with an inference timeout "
+        "and returns success only after saving the result to SQLite."
     ),
 )
 async def predict(
     data: FarmRequest,
     request: Request,
 ):
-    request_id = request.state.request_id
-
-    result = create_prediction(data, request_id)
+    result = await run_single_prediction(
+        data=data,
+        request_id=request.state.request_id,
+    )
 
     await save_prediction(
         result,
@@ -552,14 +554,14 @@ async def llm_chat(
         400: {"description": "Unknown region"},
         422: {"description": "Validation error"},
         502: {"description": "LLM provider error"},
-        503: {"description": "Storage or external service unavailable"},
+        503: {"description": "Model, storage or LLM unavailable"},
         504: {"description": "Inference or LLM timeout"},
     },
     summary="Score a farm and explain the result with an LLM",
     description=(
-        "Calculates and saves the scoring result first, then "
-        "requests an LLM explanation. The LLM does not calculate "
-        "or overwrite risk_score or risk_level. "
+        "Runs scoring with a timeout and saves the prediction first. "
+        "The external LLM then generates an explanation without "
+        "overwriting risk_score or risk_level. "
         "If the LLM fails, the prediction remains stored."
     ),
 )
@@ -569,29 +571,8 @@ async def predict_with_llm(
 ):
     request_id = request.state.request_id
 
-    validate_batch_regions([data])
-
-    try:
-        scores = await asyncio.wait_for(
-            model_predict_batch([data]),
-            timeout=config.INFERENCE_TIMEOUT_SECONDS,
-        )
-
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Inference timeout",
-        ) from exc
-
-    if len(scores) != 1:
-        raise HTTPException(
-            status_code=503,
-            detail="Scoring model returned an invalid result",
-        )
-
-    prediction = build_prediction_from_score(
+    prediction = await run_single_prediction(
         data=data,
-        score=scores[0],
         request_id=request_id,
     )
 

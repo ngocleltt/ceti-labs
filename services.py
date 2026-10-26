@@ -1,7 +1,11 @@
 from fastapi import HTTPException
-
-from model import calculate_risk
+from model import calculate_risk, model_predict_batch
 from schemas import FarmRequest, PredictionResponse
+import asyncio
+import logging
+import config
+
+logger = logging.getLogger(__name__)
 
 
 MODEL_VERSION = "1.0"
@@ -112,3 +116,70 @@ def build_prediction_from_score(
         recommendation=recommendation(level),
         model_version=MODEL_VERSION,
     )
+    
+async def run_single_prediction(
+    data: FarmRequest,
+    request_id: str,
+) -> PredictionResponse:
+    validate_batch_regions([data])
+
+    logger.info(
+        "Single inference started | request_id=%s",
+        request_id,
+    )
+
+    try:
+        scores = await asyncio.wait_for(
+            model_predict_batch([data]),
+            timeout=config.INFERENCE_TIMEOUT_SECONDS,
+        )
+
+    except asyncio.TimeoutError as exc:
+        logger.warning(
+            "Single inference timeout | request_id=%s | timeout=%s",
+            request_id,
+            config.INFERENCE_TIMEOUT_SECONDS,
+        )
+
+        raise HTTPException(
+            status_code=504,
+            detail="Inference timeout",
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Single inference failed | request_id=%s",
+            request_id,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Scoring model is unavailable",
+        ) from exc
+
+    if len(scores) != 1:
+        logger.error(
+            "Invalid single inference result | request_id=%s",
+            request_id,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Scoring model returned an invalid result",
+        )
+
+    result = build_prediction_from_score(
+        data=data,
+        score=scores[0],
+        request_id=request_id,
+    )
+
+    logger.info(
+        "Single inference completed | request_id=%s | "
+        "risk_score=%s | risk_level=%s",
+        request_id,
+        result.risk_score,
+        result.risk_level,
+    )
+
+    return result
